@@ -169,6 +169,10 @@ async def downloader(
                 if not response_obj:
                     logging.error(f"No response received for {url}")
                     return
+                # Check status code before retrieving content.
+                if response_obj.status != 200:
+                    logging.error(f"Response status for {url} is {response_obj.status}, skipping download.")
+                    return
                 try:
                     content = await page.content()
                 except Exception as e:
@@ -182,6 +186,10 @@ async def downloader(
                 response_obj = await context.request.get(url)
             except Exception as e:
                 logging.error(f"Error fetching {url} via request: {e}")
+                return
+
+            if response_obj.status != 200:
+                logging.error(f"Response status for {url} is {response_obj.status}, skipping download.")
                 return
 
             if ext:
