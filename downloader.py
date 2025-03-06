@@ -27,7 +27,7 @@ mapping_lock = asyncio.Lock()
 MAX_FILENAME_LENGTH = 255  # Maximum allowed filename length.
 
 async def load_downloaded_urls() -> Set[str]:
-    """Asynchronously load the list of already downloaded URLs from a text file."""
+    """Load list of already downloaded URLs asynchronously."""
     if await asyncio.to_thread(os.path.exists, downloaded_urls_file):
         async with aiofiles.open(downloaded_urls_file, "r") as f:
             lines = await f.readlines()
@@ -35,25 +35,25 @@ async def load_downloaded_urls() -> Set[str]:
     return set()
 
 async def append_downloaded_url(url: str) -> None:
-    """Append a newly downloaded URL to the file asynchronously and update the in‑memory set."""
+    """Append a URL to the downloaded list and update in‑memory set."""
     async with downloaded_urls_lock:
         async with aiofiles.open(downloaded_urls_file, "a") as f:
             await f.write(url + "\n")
         downloaded_urls.add(url)
 
 async def append_url_mapping(short_filename: str, url: str) -> None:
-    """Append a mapping from the short filename to the original URL."""
+    """Append a mapping from short filename to the original URL."""
     async with mapping_lock:
         async with aiofiles.open(mapping_file, "a") as f:
             await f.write(f"{short_filename}\t{url}\n")
 
 def sanitize_filename(filename: str) -> str:
-    """Sanitizes filename by removing or replacing special characters."""
+    """Sanitize filenames by replacing special characters."""
     filename = unquote(filename)
     return re.sub(r'[\\/:*?"<>|]', '_', filename)
 
-def get_extension(content_type: str) -> str:
-    """Determines the appropriate file extension based on Content-Type."""
+def get_extension_from_header(content_type: str) -> str:
+    """Determine file extension from the Content-Type header if needed."""
     mapping = {
         'text/html': 'html',
         'text/plain': 'txt',
@@ -69,34 +69,15 @@ def get_extension(content_type: str) -> str:
     }
     return mapping.get(content_type.split(';')[0], 'bin')
 
-def get_filename_from_content_disposition(header_value: Optional[str]) -> Optional[str]:
-    """
-    Extracts a filename from the Content-Disposition header if available.
-    Expected format: attachment; filename="example.txt"
-    """
-    if not header_value:
-        return None
-    parts = header_value.split(';')
-    for part in parts:
-        if 'filename=' in part:
-            filename = part.split('=', 1)[1].strip().strip('"')
-            return filename
-    return None
-
 async def reset_page(page: Page) -> None:
-    """
-    Attempts to reset the page state by navigating to 'about:blank'.
-    This helps clear any residual state from previous navigation.
-    """
+    """Reset the page by navigating to 'about:blank'."""
     try:
-        await page.goto("about:blank", wait_until='domcontentloaded', timeout=10000)
+        await page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
     except Exception as e:
         logging.warning(f"Failed to reset page state: {e}")
 
 async def safe_return_page(page: Page, page_pool: asyncio.Queue) -> None:
-    """
-    Resets the page and then returns it to the pool.
-    """
+    """Reset and return the page to the pool."""
     try:
         await reset_page(page)
     except Exception as e:
@@ -114,9 +95,14 @@ async def downloader(
     max_retries: int = 3,
 ) -> None:
     """
-    Downloads content from the URL using a shared browser context.
-    Implements retry with exponential backoff, uses a reusable page from the pool,
-    performs integrity checks, writes to a temporary file, and records the URL.
+    Downloads a URL.
+
+    If a HEAD request shows the resource's Content-Type is HTML (or if the URL extension is .html/.htm when HEAD is missing),
+    full browser navigation (page.goto) is used so that the dynamic content can load.
+    In that case, the file is always saved with a .html extension.
+    For all other resources, a direct request (context.request.get) is used.
+    
+    Files are saved into subfolders (by file type) with a short generated filename.
     """
     global shutdown_flag
     async with semaphore:
@@ -124,7 +110,7 @@ async def downloader(
             logging.info(f"Shutdown initiated, skipping URL: {url}")
             return
 
-        # Check if URL has already been processed.
+        # Skip already processed URLs.
         async with downloaded_urls_lock:
             if url in downloaded_urls:
                 logging.info(f"URL {url} already processed. Skipping.")
@@ -133,131 +119,148 @@ async def downloader(
         parsed_url = urlparse(url)
         sanitized_path = sanitize_filename(parsed_url.path.strip('/'))
         if not sanitized_path:
-            sanitized_path = 'index'
+            sanitized_path = "index"
 
-        # Exponential backoff retry mechanism.
-        page: Page = await page_pool.get()
-        response_obj: Optional[Response] = None
+        # Determine download method using a HEAD request to inspect Content-Type.
         try:
-            for attempt in range(max_retries):
+            head_response = await context.request.fetch(url, method="HEAD")
+            head_content_type = head_response.headers.get("content-type", "").lower()
+        except Exception as e:
+            logging.warning(f"HEAD request failed for {url}: {e}")
+            head_content_type = ""
+
+        _, ext = os.path.splitext(parsed_url.path)
+        ext = ext.lower()
+        html_extensions = {".html", ".htm"}
+        is_html = False
+        if head_content_type and "text/html" in head_content_type:
+            is_html = True
+        elif not head_content_type and ext in html_extensions:
+            is_html = True
+
+        download_method = "html" if is_html else "static"
+
+        response_obj: Optional[Response] = None
+        content = None
+
+        if download_method == "html":
+            # For HTML pages, always force the file extension to be "html".
+            file_extension = "html"
+            # Set defaults for HTML (text) content.
+            write_mode = "w"
+            encoding = "utf-8"
+            page: Page = await page_pool.get()
+            try:
+                for attempt in range(max_retries):
+                    try:
+                        response_obj = await page.goto(url, wait_until="networkidle", timeout=30000)
+                        # Wait a bit more to ensure the page has fully settled.
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            delay = 2 ** (attempt + 1)
+                            logging.warning(f"Attempt {attempt+1} failed for {url}: {e}. Retrying in {delay} seconds...")
+                            await reset_page(page)
+                            await asyncio.sleep(delay)
+                        else:
+                            logging.error(f"Failed to download {url} after {max_retries} attempts: {e}")
+                            return
+                if not response_obj:
+                    logging.error(f"No response received for {url}")
+                    return
                 try:
-                    response_obj = await page.goto(url, wait_until='networkidle', timeout=30000)
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        delay = 2 ** (attempt + 1)
-                        logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}. Retrying in {delay} seconds...")
-                        await reset_page(page)
-                        await asyncio.sleep(delay)
-                    else:
-                        logging.error(f"Failed to download {url} after {max_retries} attempts: {e}")
-                        return
-            if not response_obj:
-                logging.error(f"No response received for {url}")
-                return
-
-            status = response_obj.status
-            if status < 200 or status >= 300:
-                logging.error(f"URL {url} returned status code {status}. Skipping.")
-                return
-
-            content_type = response_obj.headers.get('content-type', '')
-            content_disposition = response_obj.headers.get('content-disposition', None)
-            # Note: filename_from_header is extracted but not used because we're generating our own short filename.
-            _ = get_filename_from_content_disposition(content_disposition)
-
-            # Determine file extension.
-            file_extension = get_extension(content_type)
-            # Create a subfolder for this file type.
-            subfolder = os.path.join(output_folder, file_extension)
-            if not await asyncio.to_thread(os.path.exists, subfolder):
-                await asyncio.to_thread(os.makedirs, subfolder, exist_ok=True)
-
-            # Generate a short filename using a snippet of the URL path and an MD5 hash.
-            context_part = sanitized_path[:50] if sanitized_path else 'index'
-            hash_val = hashlib.md5(url.encode('utf-8')).hexdigest()[:12]
-            short_filename = f"{context_part}_{hash_val}.{file_extension}"
-            if len(short_filename) > MAX_FILENAME_LENGTH:
-                base, ext = os.path.splitext(short_filename)
-                allowed_length = MAX_FILENAME_LENGTH - len(ext)
-                base = base[:allowed_length]
-                short_filename = base + ext
-
-            file_path = os.path.join(subfolder, short_filename)
-            
-            # Check if file already exists.
-            if await asyncio.to_thread(os.path.exists, file_path) and not args.overwrite:
-                logging.info(f"File {file_path} already exists. Skipping.")
-                await append_downloaded_url(url)
-                return
-
-            # Decide between text and binary writing.
-            if any(sub in content_type for sub in ['text', 'json', 'javascript', 'css']) or file_path.endswith(('.html', '.txt', '.json', '.js', '.css')):
-                if file_path.endswith('.html'):
                     content = await page.content()
-                else:
-                    content = await response_obj.text()
-                if file_path.endswith('.js'):
-                    content = beautify(content)
-                write_mode = 'w'
-                encoding = 'utf-8'
+                except Exception as e:
+                    logging.error(f"Error retrieving page content for {url}: {e}")
+                    return
+            finally:
+                await safe_return_page(page, page_pool)
+        else:
+            # For static resources, use a direct HTTP request.
+            try:
+                response_obj = await context.request.get(url)
+            except Exception as e:
+                logging.error(f"Error fetching {url} via request: {e}")
+                return
+
+            if ext:
+                file_extension = ext[1:]
             else:
-                content = await response_obj.body()  # binary content
-                write_mode = 'wb'
+                file_extension = get_extension_from_header(response_obj.headers.get("content-type", ""))
+
+            # Determine if content is text (for beautification) or binary.
+            text_extensions = {"js", "css", "json", "html", "htm", "txt"}
+            if file_extension in text_extensions:
+                try:
+                    content = await response_obj.text()
+                except Exception as e:
+                    logging.error(f"Error reading text content from {url}: {e}")
+                    return
+                if file_extension == "js":
+                    content = beautify(content)
+                write_mode = "w"
+                encoding = "utf-8"
+            else:
+                try:
+                    content = await response_obj.body()  # binary content
+                except Exception as e:
+                    logging.error(f"Error reading binary content from {url}: {e}")
+                    return
+                write_mode = "wb"
                 encoding = None
 
-            # Write to a temporary file first.
-            temp_file_path = file_path + ".tmp"
-            try:
-                if write_mode == 'w':
-                    async with aiofiles.open(temp_file_path, write_mode, encoding=encoding) as f:
-                        await f.write(content)
-                else:
-                    async with aiofiles.open(temp_file_path, write_mode) as f:
-                        await f.write(content)
-                # Rename temporary file to final filename.
-                await asyncio.to_thread(os.replace, temp_file_path, file_path)
+        # Create a subfolder for the file type.
+        subfolder = os.path.join(output_folder, file_extension)
+        if not await asyncio.to_thread(os.path.exists, subfolder):
+            await asyncio.to_thread(os.makedirs, subfolder, exist_ok=True)
 
-                # Integrity check: if content-length is provided and no content-encoding,
-                # compare the file size.
-                expected_length_str = response_obj.headers.get("content-length")
-                content_encoding = response_obj.headers.get("content-encoding", "").lower()
-                if expected_length_str and not content_encoding:
-                    try:
-                        expected_length = int(expected_length_str)
-                        actual_length = await asyncio.to_thread(os.path.getsize, file_path)
-                        if actual_length != expected_length:
-                            logging.error(f"Integrity check failed for {short_filename}: expected {expected_length}, got {actual_length}")
-                            try:
-                                await asyncio.to_thread(os.remove, file_path)
-                            except Exception as e:
-                                logging.error(f"Error removing file {file_path}: {e}")
-                            return
-                    except Exception as e:
-                        logging.warning(f"Integrity check error for {short_filename}: {e}")
-                elif expected_length_str and content_encoding:
-                    logging.info(f"Skipping integrity check for {short_filename} due to content-encoding: {content_encoding}")
+        # Generate a short filename using a snippet of the sanitized path and an MD5 hash.
+        context_part = sanitized_path[:50] if sanitized_path else "index"
+        hash_val = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+        short_filename = f"{context_part}_{hash_val}.{file_extension}"
+        if len(short_filename) > MAX_FILENAME_LENGTH:
+            base, ext_part = os.path.splitext(short_filename)
+            allowed_length = MAX_FILENAME_LENGTH - len(ext_part)
+            base = base[:allowed_length]
+            short_filename = base + ext_part
 
-                logging.info(f"Downloaded: {short_filename}")
-                await append_downloaded_url(url)
-                await append_url_mapping(short_filename, url)
-            except Exception as e:
-                logging.error(f"Error saving file for {url}: {e}")
-                if await asyncio.to_thread(os.path.exists, temp_file_path):
-                    try:
-                        await asyncio.to_thread(os.remove, temp_file_path)
-                    except Exception as e:
-                        logging.error(f"Error removing temporary file {temp_file_path}: {e}")
-                return
-        finally:
-            if page is not None:
-                await safe_return_page(page, page_pool)
+        file_path = os.path.join(subfolder, short_filename)
+
+        # Check if file already exists.
+        if await asyncio.to_thread(os.path.exists, file_path) and not args.overwrite:
+            logging.info(f"File {file_path} already exists. Skipping.")
+            await append_downloaded_url(url)
+            return
+
+        # Write content to a temporary file first.
+        temp_file_path = file_path + ".tmp"
+        try:
+            if write_mode == "w":
+                async with aiofiles.open(temp_file_path, write_mode, encoding=encoding) as f:
+                    await f.write(content)
+            else:
+                async with aiofiles.open(temp_file_path, write_mode) as f:
+                    await f.write(content)
+            await asyncio.to_thread(os.replace, temp_file_path, file_path)
+
+            logging.info(f"Downloaded: {short_filename}")
+            await append_downloaded_url(url)
+            await append_url_mapping(short_filename, url)
+        except Exception as e:
+            logging.error(f"Error saving file for {url}: {e}")
+            if await asyncio.to_thread(os.path.exists, temp_file_path):
+                try:
+                    await asyncio.to_thread(os.remove, temp_file_path)
+                except Exception as e:
+                    logging.error(f"Error removing temporary file {temp_file_path}: {e}")
+            return
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Download URLs using Playwright.")
     parser.add_argument("input_file", help="File containing list of URLs (one per line)")
     parser.add_argument("output_folder", help="Output folder for downloaded files")
-    parser.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent downloads (default: 5)")
+    parser.add_argument("--concurrency", type=int, default=5, help="Maximum concurrent downloads (default: 5)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--logfile", help="Optional log file to write output to")
     args = parser.parse_args()
@@ -268,7 +271,7 @@ async def main() -> None:
         logging.getLogger().addHandler(file_handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    if os.name == 'nt':
+    if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     loop = asyncio.get_running_loop()
@@ -277,9 +280,9 @@ async def main() -> None:
         logging.info("Shutdown signal received, no new tasks will be started.")
         shutdown_flag = True
 
-    if os.name == 'nt':
+    if os.name == "nt":
         signal.signal(signal.SIGINT, lambda s, f: shutdown_handler())
-        if hasattr(signal, 'SIGTERM'):
+        if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, lambda s, f: shutdown_handler())
     else:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -288,11 +291,10 @@ async def main() -> None:
     global downloaded_urls
     downloaded_urls = await load_downloaded_urls()
 
-    # Ensure the downloaded URLs and mapping file exist.
     if not os.path.exists(downloaded_urls_file):
-        open(downloaded_urls_file, 'a').close()
+        open(downloaded_urls_file, "a").close()
     if not os.path.exists(mapping_file):
-        open(mapping_file, 'a').close()
+        open(mapping_file, "a").close()
 
     if not os.path.exists(args.output_folder):
         await asyncio.to_thread(os.makedirs, args.output_folder, exist_ok=True)
@@ -311,6 +313,7 @@ async def main() -> None:
         browser = await p.chromium.launch(headless=True)
         context: BrowserContext = await browser.new_context(user_agent="Mozilla/5.0 (compatible; MyDownloader/1.0)")
 
+        # Create a pool of pages for HTML (dynamic) requests.
         page_pool: asyncio.Queue = asyncio.Queue()
         for _ in range(args.concurrency):
             page = await context.new_page()
