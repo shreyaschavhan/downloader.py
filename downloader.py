@@ -19,6 +19,10 @@ downloaded_urls_file: str = "downloaded_urls.txt"
 downloaded_urls: Set[str] = set()
 downloaded_urls_lock = asyncio.Lock()
 
+# Globals for caching existing output files to speed up skip checks.
+existing_files: Set[str] = set()
+existing_files_lock = asyncio.Lock()
+
 MAX_FILENAME_LENGTH = 255  # Maximum allowed filename length.
 
 async def load_downloaded_urls() -> Set[str]:
@@ -113,7 +117,7 @@ async def downloader(
             logging.info(f"Shutdown initiated, skipping URL: {url}")
             return
 
-        # Check if URL was already processed.
+        # Although pre-filtering is done in main, this check remains as an extra safeguard.
         async with downloaded_urls_lock:
             if url in downloaded_urls:
                 logging.info(f"URL {url} already processed. Skipping.")
@@ -130,7 +134,6 @@ async def downloader(
             await asyncio.to_thread(os.makedirs, output_folder)
 
         page: Page = await page_pool.get()
-
         response_obj: Optional[Response] = None
 
         try:
@@ -175,10 +178,14 @@ async def downloader(
                 filename = base + ext
 
             file_path = os.path.join(output_folder, filename)
-            # Skip if file exists and --overwrite is not set.
-            if await asyncio.to_thread(os.path.exists, file_path) and not args.overwrite:
-                logging.info(f"File {file_path} already exists. Skipping.")
-                return
+            
+            # Check against cached existing files.
+            async with existing_files_lock:
+                if filename in existing_files and not args.overwrite:
+                    logging.info(f"File {file_path} already exists. Skipping.")
+                    # Also mark URL as processed.
+                    await append_downloaded_url(url)
+                    return
 
             # Decide text vs. binary.
             if any(sub in content_type for sub in ['text', 'json', 'javascript', 'css']) or file_path.endswith(('.html', '.txt', '.json', '.js', '.css')):
@@ -222,6 +229,10 @@ async def downloader(
 
                 logging.info(f"Downloaded: {filename}")
                 await append_downloaded_url(url)
+                
+                # Update the cache with the newly downloaded file.
+                async with existing_files_lock:
+                    existing_files.add(filename)
             except Exception as e:
                 logging.error(f"Error saving file for {url}: {e}")
                 if await asyncio.to_thread(os.path.exists, temp_file_path):
@@ -241,12 +252,16 @@ async def main() -> None:
     parser.add_argument("--logfile", help="Optional log file to write output to")
     args = parser.parse_args()
 
-    # Enhanced logging: add a file handler if --logfile is provided.
+    # Logging setup
     if args.logfile:
         file_handler = logging.FileHandler(args.logfile)
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(file_handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # For Windows compatibility, use WindowsSelectorEventLoopPolicy.
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # Register signal handlers for graceful shutdown.
     loop = asyncio.get_running_loop()
@@ -256,16 +271,36 @@ async def main() -> None:
         logging.info("Shutdown signal received, no new tasks will be started.")
         shutdown_flag = True
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown_handler)
+    if os.name == 'nt':
+        signal.signal(signal.SIGINT, lambda s, f: shutdown_handler())
+        if hasattr(signal, 'SIGTERM'):
+            signal.signal(signal.SIGTERM, lambda s, f: shutdown_handler())
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, shutdown_handler)
 
-    global downloaded_urls
+    global downloaded_urls, existing_files, existing_files_lock
     downloaded_urls = await load_downloaded_urls()
 
-    # Read and deduplicate URLs from the input file asynchronously.
+    # Ensure the downloaded URLs file exists.
+    if not os.path.exists(downloaded_urls_file):
+        open(downloaded_urls_file, 'a').close()
+
+    # Ensure output folder exists and cache existing filenames.
+    if not os.path.exists(args.output_folder):
+        os.makedirs(args.output_folder)
+    existing_files = set(os.listdir(args.output_folder))
+    existing_files_lock = asyncio.Lock()
+
+    # Read and deduplicate URLs from the input file.
     async with aiofiles.open(args.input_file, "r") as f:
         lines = await f.readlines()
-    urls = list({line.strip() for line in lines if line.strip()})
+    all_urls = {line.strip() for line in lines if line.strip()}
+    # Pre-filter URLs by removing those already processed.
+    urls = [url for url in all_urls if url not in downloaded_urls]
+    if not urls:
+        logging.info("No new URLs to download. Exiting.")
+        return
 
     semaphore = asyncio.Semaphore(args.concurrency)
 
