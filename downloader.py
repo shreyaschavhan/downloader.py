@@ -4,6 +4,7 @@ import asyncio
 import logging
 import argparse
 import signal
+import hashlib
 from typing import Set, Optional
 from urllib.parse import urlparse, unquote
 
@@ -18,6 +19,10 @@ shutdown_flag: bool = False
 downloaded_urls_file: str = "downloaded_urls.txt"
 downloaded_urls: Set[str] = set()
 downloaded_urls_lock = asyncio.Lock()
+
+# Mapping file to map short filenames to original URLs.
+mapping_file: str = "url_mapping.txt"
+mapping_lock = asyncio.Lock()
 
 # Globals for caching existing output files to speed up skip checks.
 existing_files: Set[str] = set()
@@ -40,8 +45,14 @@ async def append_downloaded_url(url: str) -> None:
             await f.write(url + "\n")
         downloaded_urls.add(url)
 
+async def append_url_mapping(short_filename: str, url: str) -> None:
+    """Append a mapping from the short filename to the original URL."""
+    async with mapping_lock:
+        async with aiofiles.open(mapping_file, "a") as f:
+            await f.write(f"{short_filename}\t{url}\n")
+
 def sanitize_filename(filename: str) -> str:
-    """Sanitizes filename by removing special characters."""
+    """Sanitizes filename by removing or replacing special characters."""
     filename = unquote(filename)
     return re.sub(r'[\\/:*?"<>|]', '_', filename)
 
@@ -117,7 +128,7 @@ async def downloader(
             logging.info(f"Shutdown initiated, skipping URL: {url}")
             return
 
-        # Although pre-filtering is done in main, this check remains as an extra safeguard.
+        # Check if URL has already been processed.
         async with downloaded_urls_lock:
             if url in downloaded_urls:
                 logging.info(f"URL {url} already processed. Skipping.")
@@ -129,10 +140,11 @@ async def downloader(
         if not sanitized_path:
             sanitized_path = 'index'
 
-        # Ensure the output folder exists.
+        # Ensure the output folder exists (using exist_ok=True via threaded call).
         if not await asyncio.to_thread(os.path.exists, output_folder):
-            await asyncio.to_thread(os.makedirs, output_folder)
+            await asyncio.to_thread(os.makedirs, output_folder, exist_ok=True)
 
+        # Acquire a page from the pool.
         page: Page = await page_pool.get()
         response_obj: Optional[Response] = None
 
@@ -162,32 +174,32 @@ async def downloader(
 
             content_type = response_obj.headers.get('content-type', '')
             content_disposition = response_obj.headers.get('content-disposition', None)
+            # Note: filename_from_header is extracted but not used, because we're generating our own short filename.
             filename_from_header = get_filename_from_content_disposition(content_disposition)
 
-            if filename_from_header:
-                filename = sanitize_filename(filename_from_header)
-            else:
-                file_extension = get_extension(content_type)
-                filename = f"{domain}_{sanitized_path}.{file_extension}"
+            # Determine file extension.
+            file_extension = get_extension(content_type)
 
-            # Enforce maximum filename length.
-            if len(filename) > MAX_FILENAME_LENGTH:
-                base, ext = os.path.splitext(filename)
+            # Generate a short filename using a snippet of the URL path and an MD5 hash.
+            context_part = sanitized_path[:50] if sanitized_path else 'index'
+            hash_val = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+            short_filename = f"{context_part}_{hash_val}.{file_extension}"
+            if len(short_filename) > MAX_FILENAME_LENGTH:
+                base, ext = os.path.splitext(short_filename)
                 allowed_length = MAX_FILENAME_LENGTH - len(ext)
                 base = base[:allowed_length]
-                filename = base + ext
+                short_filename = base + ext
 
-            file_path = os.path.join(output_folder, filename)
+            file_path = os.path.join(output_folder, short_filename)
             
-            # Check against cached existing files.
+            # Check if the file already exists (using cached filenames) and skip if not overwriting.
             async with existing_files_lock:
-                if filename in existing_files and not args.overwrite:
+                if short_filename in existing_files and not args.overwrite:
                     logging.info(f"File {file_path} already exists. Skipping.")
-                    # Also mark URL as processed.
                     await append_downloaded_url(url)
                     return
 
-            # Decide text vs. binary.
+            # Decide between text and binary writing based on content-type.
             if any(sub in content_type for sub in ['text', 'json', 'javascript', 'css']) or file_path.endswith(('.html', '.txt', '.json', '.js', '.css')):
                 if file_path.endswith('.html'):
                     content = await page.content()
@@ -198,11 +210,11 @@ async def downloader(
                 write_mode = 'w'
                 encoding = 'utf-8'
             else:
-                content = await response_obj.body()  # binary
+                content = await response_obj.body()  # binary content
                 write_mode = 'wb'
                 encoding = None
 
-            # Write content to a temporary file first.
+            # Write to a temporary file first.
             temp_file_path = file_path + ".tmp"
             try:
                 if write_mode == 'w':
@@ -211,35 +223,36 @@ async def downloader(
                 else:
                     async with aiofiles.open(temp_file_path, write_mode) as f:
                         await f.write(content)
-                # Rename the temp file to the final filename.
+                # Rename the temporary file to its final name.
                 await asyncio.to_thread(os.replace, temp_file_path, file_path)
 
-                # Integrity check: if content-length header exists, compare with file size.
+                # Integrity check: if content-length is provided, compare file size.
                 expected_length_str = response_obj.headers.get("content-length")
                 if expected_length_str:
                     try:
                         expected_length = int(expected_length_str)
                         actual_length = await asyncio.to_thread(os.path.getsize, file_path)
                         if actual_length != expected_length:
-                            logging.error(f"Integrity check failed for {filename}: expected {expected_length}, got {actual_length}")
+                            logging.error(f"Integrity check failed for {short_filename}: expected {expected_length}, got {actual_length}")
                             await asyncio.to_thread(os.remove, file_path)
                             return
                     except Exception as e:
-                        logging.warning(f"Integrity check error for {filename}: {e}")
+                        logging.warning(f"Integrity check error for {short_filename}: {e}")
 
-                logging.info(f"Downloaded: {filename}")
+                logging.info(f"Downloaded: {short_filename}")
                 await append_downloaded_url(url)
+                await append_url_mapping(short_filename, url)
                 
-                # Update the cache with the newly downloaded file.
+                # Update the cache with the new file.
                 async with existing_files_lock:
-                    existing_files.add(filename)
+                    existing_files.add(short_filename)
             except Exception as e:
                 logging.error(f"Error saving file for {url}: {e}")
                 if await asyncio.to_thread(os.path.exists, temp_file_path):
                     await asyncio.to_thread(os.remove, temp_file_path)
                 return
         finally:
-            # Always reset and return the page to the pool.
+            # Ensure the page is always returned to the pool.
             if page is not None:
                 await safe_return_page(page, page_pool)
 
@@ -252,20 +265,19 @@ async def main() -> None:
     parser.add_argument("--logfile", help="Optional log file to write output to")
     args = parser.parse_args()
 
-    # Logging setup
+    # Logging setup: add file handler if a logfile is provided.
     if args.logfile:
         file_handler = logging.FileHandler(args.logfile)
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(file_handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # For Windows compatibility, use WindowsSelectorEventLoopPolicy.
+    # For Windows compatibility.
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # Register signal handlers for graceful shutdown.
     loop = asyncio.get_running_loop()
-
     def shutdown_handler() -> None:
         global shutdown_flag
         logging.info("Shutdown signal received, no new tasks will be started.")
@@ -282,13 +294,15 @@ async def main() -> None:
     global downloaded_urls, existing_files, existing_files_lock
     downloaded_urls = await load_downloaded_urls()
 
-    # Ensure the downloaded URLs file exists.
+    # Ensure the downloaded URLs and mapping file exist.
     if not os.path.exists(downloaded_urls_file):
         open(downloaded_urls_file, 'a').close()
+    if not os.path.exists(mapping_file):
+        open(mapping_file, 'a').close()
 
-    # Ensure output folder exists and cache existing filenames.
+    # Ensure the output folder exists (using threaded call with exist_ok=True).
     if not os.path.exists(args.output_folder):
-        os.makedirs(args.output_folder)
+        await asyncio.to_thread(os.makedirs, args.output_folder, exist_ok=True)
     existing_files = set(os.listdir(args.output_folder))
     existing_files_lock = asyncio.Lock()
 
@@ -308,7 +322,7 @@ async def main() -> None:
         browser = await p.chromium.launch(headless=True)
         context: BrowserContext = await browser.new_context(user_agent="Mozilla/5.0 (compatible; MyDownloader/1.0)")
 
-        # Create a pool of pages to reuse.
+        # Create a pool of pages for reuse.
         page_pool: asyncio.Queue = asyncio.Queue()
         for _ in range(args.concurrency):
             page = await context.new_page()
