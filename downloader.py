@@ -6,7 +6,7 @@ import argparse
 import signal
 import hashlib
 from typing import Set, Optional
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlsplit, urlunsplit, quote
 
 import aiofiles
 from jsbeautifier import beautify
@@ -22,6 +22,17 @@ class TqdmLoggingHandler(logging.Handler):
             self.flush()
         except Exception:
             self.handleError(record)
+
+# Helper function: percent-encode URL's path and query.
+def encode_url(url: str) -> str:
+    parts = urlsplit(url)
+    encoded_path = quote(parts.path, safe="/")
+    encoded_query = quote(parts.query, safe="=&")
+    return urlunsplit((parts.scheme, parts.netloc, encoded_path, encoded_query, parts.fragment))
+
+# Helper function: remove any null bytes from URL.
+def clean_url(url: str) -> str:
+    return url.replace("\x00", "")
 
 # Global shutdown flag for graceful termination.
 shutdown_flag: bool = False
@@ -108,8 +119,8 @@ async def downloader(
     """
     Downloads a URL.
 
-    If a HEAD request shows the resource's Content-Type is HTML (or if the URL extension is .html/.htm when HEAD is missing),
-    full browser navigation (page.goto) is used so that the dynamic content can load.
+    If a HEAD request shows the resource's Content-Type is HTML (or if the URL extension is .html/.htm
+    or is missing, we assume HTML), full browser navigation (page.goto) is used so that dynamic content loads.
     In that case, the file is always saved with a .html extension.
     For all other resources, a direct request (context.request.get) is used.
     
@@ -121,20 +132,25 @@ async def downloader(
             logging.info(f"Shutdown initiated, skipping URL: {url}")
             return
 
+        # Clean URL from null bytes.
+        url = clean_url(url)
+        
         # Skip already processed URLs.
         async with downloaded_urls_lock:
             if url in downloaded_urls:
                 logging.info(f"URL {url} already processed. Skipping.")
                 return
 
+        # Always use encoded URL for requests.
+        encoded_url = encode_url(url)
         parsed_url = urlparse(url)
         sanitized_path = sanitize_filename(parsed_url.path.strip('/'))
         if not sanitized_path:
             sanitized_path = "index"
 
-        # Determine download method using a HEAD request to inspect Content-Type.
+        # Determine download method using a HEAD request.
         try:
-            head_response = await context.request.fetch(url, method="HEAD")
+            head_response = await context.request.fetch(encoded_url, method="HEAD")
             head_content_type = head_response.headers.get("content-type", "").lower()
         except Exception as e:
             logging.warning(f"HEAD request failed for {url}: {e}")
@@ -142,8 +158,12 @@ async def downloader(
 
         _, ext = os.path.splitext(parsed_url.path)
         ext = ext.lower()
+        # If no extension, assume HTML.
+        if not ext:
+            is_html = True
+        else:
+            is_html = False
         html_extensions = {".html", ".htm"}
-        is_html = False
         if head_content_type and "text/html" in head_content_type:
             is_html = True
         elif not head_content_type and ext in html_extensions:
@@ -155,7 +175,7 @@ async def downloader(
         content = None
 
         if download_method == "html":
-            # For HTML pages, force the file extension to be "html".
+            # For HTML pages, force file extension to be "html".
             file_extension = "html"
             write_mode = "w"
             encoding = "utf-8"
@@ -163,7 +183,7 @@ async def downloader(
             try:
                 for attempt in range(max_retries):
                     try:
-                        response_obj = await page.goto(url, wait_until="networkidle", timeout=30000)
+                        response_obj = await page.goto(encoded_url, wait_until="networkidle", timeout=30000)
                         await page.wait_for_load_state("networkidle", timeout=10000)
                         break
                     except Exception as e:
@@ -190,7 +210,7 @@ async def downloader(
                 await safe_return_page(page, page_pool)
         else:
             try:
-                response_obj = await context.request.get(url)
+                response_obj = await context.request.get(encoded_url)
             except Exception as e:
                 logging.error(f"Error fetching {url} via request: {e}")
                 return
