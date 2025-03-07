@@ -11,6 +11,17 @@ from urllib.parse import urlparse, unquote
 import aiofiles
 from jsbeautifier import beautify
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
+from tqdm import tqdm
+
+# Custom logging handler that uses tqdm.write() to output messages.
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 # Global shutdown flag for graceful termination.
 shutdown_flag: bool = False
@@ -144,9 +155,8 @@ async def downloader(
         content = None
 
         if download_method == "html":
-            # For HTML pages, always force the file extension to be "html".
+            # For HTML pages, force the file extension to be "html".
             file_extension = "html"
-            # Set defaults for HTML (text) content.
             write_mode = "w"
             encoding = "utf-8"
             page: Page = await page_pool.get()
@@ -154,7 +164,6 @@ async def downloader(
                 for attempt in range(max_retries):
                     try:
                         response_obj = await page.goto(url, wait_until="networkidle", timeout=30000)
-                        # Wait a bit more to ensure the page has fully settled.
                         await page.wait_for_load_state("networkidle", timeout=10000)
                         break
                     except Exception as e:
@@ -169,7 +178,6 @@ async def downloader(
                 if not response_obj:
                     logging.error(f"No response received for {url}")
                     return
-                # Check status code before retrieving content.
                 if response_obj.status != 200:
                     logging.error(f"Response status for {url} is {response_obj.status}, skipping download.")
                     return
@@ -181,7 +189,6 @@ async def downloader(
             finally:
                 await safe_return_page(page, page_pool)
         else:
-            # For static resources, use a direct HTTP request.
             try:
                 response_obj = await context.request.get(url)
             except Exception as e:
@@ -197,7 +204,6 @@ async def downloader(
             else:
                 file_extension = get_extension_from_header(response_obj.headers.get("content-type", ""))
 
-            # Determine if content is text (for beautification) or binary.
             text_extensions = {"js", "css", "json", "html", "htm", "txt"}
             if file_extension in text_extensions:
                 try:
@@ -211,7 +217,7 @@ async def downloader(
                 encoding = "utf-8"
             else:
                 try:
-                    content = await response_obj.body()  # binary content
+                    content = await response_obj.body()
                 except Exception as e:
                     logging.error(f"Error reading binary content from {url}: {e}")
                     return
@@ -223,7 +229,6 @@ async def downloader(
         if not await asyncio.to_thread(os.path.exists, subfolder):
             await asyncio.to_thread(os.makedirs, subfolder, exist_ok=True)
 
-        # Generate a short filename using a snippet of the sanitized path and an MD5 hash.
         context_part = sanitized_path[:50] if sanitized_path else "index"
         hash_val = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
         short_filename = f"{context_part}_{hash_val}.{file_extension}"
@@ -235,13 +240,11 @@ async def downloader(
 
         file_path = os.path.join(subfolder, short_filename)
 
-        # Check if file already exists.
         if await asyncio.to_thread(os.path.exists, file_path) and not args.overwrite:
             logging.info(f"File {file_path} already exists. Skipping.")
             await append_downloaded_url(url)
             return
 
-        # Write content to a temporary file first.
         temp_file_path = file_path + ".tmp"
         try:
             if write_mode == "w":
@@ -273,11 +276,20 @@ async def main() -> None:
     parser.add_argument("--logfile", help="Optional log file to write output to")
     args = parser.parse_args()
 
+    # Set up custom logging to use tqdm.write()
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    handler = TqdmLoggingHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
     if args.logfile:
         file_handler = logging.FileHandler(args.logfile)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(file_handler)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -332,15 +344,16 @@ async def main() -> None:
             for url in urls
         ]
 
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            logging.info("Tasks were cancelled during shutdown.")
-        finally:
-            while not page_pool.empty():
-                page: Page = await page_pool.get()
-                await page.close()
-            await browser.close()
+        pbar = tqdm(total=len(urls), desc="Downloading URLs")
+        for task in asyncio.as_completed(tasks):
+            await task
+            pbar.update(1)
+        pbar.close()
+
+        while not page_pool.empty():
+            page: Page = await page_pool.get()
+            await page.close()
+        await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
