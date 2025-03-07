@@ -7,7 +7,7 @@ Python Script to Download a list of URLs efficiently. Especially the html files 
 - Basic Usage:
   
 ```sh
-downloader.py input_file output_file
+downloader.py input_file output_folder
 ```
 
 - All available args:
