@@ -16,7 +16,7 @@ from jsbeautifier import beautify
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
 from tqdm import tqdm
 from bs4 import BeautifulSoup
-import html2text  # For HTML to Markdown conversion
+import html2text  # Added for HTML to Markdown conversion; install with `pip install html2text`
 
 # Custom logging handler that uses tqdm.write() for non-interfering progress output.
 class TqdmLoggingHandler(logging.Handler):
@@ -42,10 +42,13 @@ def clean_url(url: str) -> str:
 # Function to normalize HTML by removing non-critical dynamic parts.
 def normalize_html(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
+    # Remove script and style tags, as these often include dynamic content.
     for tag in soup(["script", "style"]):
         tag.decompose()
+    # Optionally, remove comments
     for comment in soup.find_all(string=lambda text: isinstance(text, type(soup.Comment))):
         comment.extract()
+    # Remove extra whitespace and newlines
     normalized = ' '.join(soup.prettify().split())
     return normalized
 
@@ -163,27 +166,24 @@ async def downloader(
         parsed_url = urlparse(url)
         sanitized_path = sanitize_filename(parsed_url.path.strip('/')) or "index"
 
-        # Determine if it's likely HTML
         try:
             head_response = await context.request.fetch(encoded_url, method="HEAD")
             head_content_type = head_response.headers.get("content-type", "").lower()
         except Exception:
             head_content_type = ""
+
         _, ext = os.path.splitext(parsed_url.path)
         ext = ext.lower()
         is_html = (not ext or (head_content_type and "text/html" in head_content_type) or ext in {".html", ".htm"})
-
-        # Decide whether to use browser or direct GET
-        use_browser = is_html and not args.static
+        download_method = "html" if is_html else "static"
 
         response_obj: Optional[Response] = None
         content = None
-        file_extension = None
         write_mode = None
         encoding = None
+        file_extension = None
 
-        if use_browser:
-            # Use browser for dynamic HTML content
+        if download_method == "html":
             page: Page = await page_pool.get()
             try:
                 for attempt in range(max_retries):
@@ -210,54 +210,50 @@ async def downloader(
                     return
             finally:
                 await safe_return_page(page, page_pool)
-            file_extension = "md" if args.markdown else "html"
         else:
-            # Use direct GET for static HTML or non-HTML files
             try:
                 response_obj = await context.request.get(encoded_url)
             except Exception as e:
                 logging.error(f"Error fetching {url} via request: {e}")
                 return
+
             if response_obj.status != 200:
                 logging.error(f"Response status for {url} is {response_obj.status}, skipping download.")
                 return
-            actual_content_type = response_obj.headers.get("content-type", "").lower()
-            if "text/html" in actual_content_type:
-                is_html = True
-                file_extension = "md" if args.markdown else "html"
+
+            if ext:
+                file_extension = ext[1:]
+            else:
+                file_extension = get_extension_from_header(response_obj.headers.get("content-type", ""))
+
+            text_extensions = {"js", "css", "json", "txt"}
+            if file_extension in text_extensions:
                 try:
                     content = await response_obj.text()
                 except Exception as e:
                     logging.error(f"Error reading text content from {url}: {e}")
                     return
+                write_mode = "w"
+                encoding = "utf-8"
             else:
-                is_html = False
-                if ext:
-                    file_extension = ext[1:]
-                else:
-                    file_extension = get_extension_from_header(actual_content_type)
-                text_extensions = {"js", "css", "json", "txt"}
-                if file_extension in text_extensions:
-                    try:
-                        content = await response_obj.text()
-                    except Exception as e:
-                        logging.error(f"Error reading text content from {url}: {e}")
-                        return
-                else:
-                    try:
-                        content = await response_obj.body()
-                    except Exception as e:
-                        logging.error(f"Error reading binary content from {url}: {e}")
-                        return
+                try:
+                    content = await response_obj.body()
+                except Exception as e:
+                    logging.error(f"Error reading binary content from {url}: {e}")
+                    return
+                write_mode = "wb"
+                encoding = None
 
-        # Process content
-        if is_html:
+        # Determine content to save and calculate hash
+        if download_method == "html":
             if args.markdown:
                 h = html2text.HTML2Text()
-                h.ignore_links = False
+                h.ignore_links = False  # Keep links in Markdown; set to True to ignore them
                 content_to_save = h.handle(content)
+                file_extension = "md"
             else:
                 content_to_save = normalize_html(content)
+                file_extension = "html"
             write_mode = "w"
             encoding = "utf-8"
             content_bytes = content_to_save.encode('utf-8')
@@ -276,6 +272,7 @@ async def downloader(
 
         content_hash = hashlib.md5(content_bytes).hexdigest()
 
+        # Check if duplicate content exists regardless of URL
         if content_hash in downloaded_hashes:
             filename = downloaded_hashes[content_hash]
             logging.info(f"Duplicate content detected for {url}. Already downloaded as {filename}.")
@@ -283,6 +280,7 @@ async def downloader(
             await append_downloaded_url(url)
             return
 
+        # New filename: include sanitized path and 8 characters of content hash
         filename = f"{sanitized_path}_{content_hash[:8]}.{file_extension}"
         subfolder = os.path.join(output_folder, file_extension)
         if not await asyncio.to_thread(os.path.exists, subfolder):
@@ -316,14 +314,13 @@ async def downloader(
             return
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Combined Downloader with enhanced URL handling, optional HTML to Markdown conversion, and direct download for static sites.")
+    parser = argparse.ArgumentParser(description="Combined Downloader with enhanced URL handling and optional HTML to Markdown conversion.")
     parser.add_argument("input_file", help="File containing list of URLs (one per line)")
     parser.add_argument("output_folder", help="Output folder for downloaded files")
     parser.add_argument("--concurrency", type=int, default=5, help="Maximum concurrent downloads (default: 5)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--logfile", help="Optional log file to write output to")
     parser.add_argument("--markdown", action="store_true", help="Convert HTML files to Markdown (.md) instead of saving as HTML")
-    parser.add_argument("--static", action="store_true", help="For static sites, directly download HTML files without using a browser")
     args = parser.parse_args()
 
     logger = logging.getLogger()
