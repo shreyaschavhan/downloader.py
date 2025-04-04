@@ -13,11 +13,22 @@ downloader.py input_file output_folder
 - All available args:
 
 ```py
- parser = argparse.ArgumentParser(description="Download URLs using Playwright.")
-    parser.add_argument("input_file", help="File containing list of URLs (one per line)")
-    parser.add_argument("output_folder", help="Output folder for downloaded files")
-    parser.add_argument("--concurrency", type=int, default=5, help="Maximum number of concurrent downloads (default: 5)")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    parser.add_argument("--logfile", help="Optional log file to write output to")
+usage: downloader.py [-h] [--concurrency CONCURRENCY] [--overwrite] [--logfile LOGFILE] [--markdown]
+                     input_file output_folder
+
+Combined Downloader with enhanced URL handling and optional HTML to Markdown conversion.
+
+positional arguments:
+  input_file            File containing list of URLs (one per line)
+  output_folder         Output folder for downloaded files
+
+options:
+  -h, --help            show this help message and exit
+  --concurrency CONCURRENCY
+                        Maximum concurrent downloads (default: 5)
+  --overwrite           Overwrite existing files
+  --logfile LOGFILE     Optional log file to write output to
+  --markdown            Convert HTML files to Markdown (.md) instead of saving as HTML
+
 ```
 
