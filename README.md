@@ -13,10 +13,11 @@ downloader.py input_file output_folder
 - All available args:
 
 ```py
-usage: downloader.py [-h] [--concurrency CONCURRENCY] [--overwrite] [--logfile LOGFILE] [--markdown]
+usage: downloader.py [-h] [--concurrency CONCURRENCY] [--overwrite] [--logfile LOGFILE] [--markdown] [--static]
                      input_file output_folder
 
-Combined Downloader with enhanced URL handling and optional HTML to Markdown conversion.
+Combined Downloader with enhanced URL handling, optional HTML to Markdown conversion, and direct download for static
+sites.
 
 positional arguments:
   input_file            File containing list of URLs (one per line)
@@ -29,6 +30,6 @@ options:
   --overwrite           Overwrite existing files
   --logfile LOGFILE     Optional log file to write output to
   --markdown            Convert HTML files to Markdown (.md) instead of saving as HTML
-
+  --static              For static sites, directly download HTML files without using a browser
 ```
 
