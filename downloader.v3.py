@@ -15,8 +15,7 @@ import aiofiles
 from jsbeautifier import beautify
 from playwright.async_api import async_playwright, BrowserContext, Page, Response
 from tqdm import tqdm
-from bs4 import BeautifulSoup
-import html2text  # Added for HTML to Markdown conversion; install with `pip install html2text`
+from bs4 import BeautifulSoup  # New dependency for HTML normalization
 
 # Custom logging handler that uses tqdm.write() for non-interfering progress output.
 class TqdmLoggingHandler(logging.Handler):
@@ -184,6 +183,9 @@ async def downloader(
         file_extension = None
 
         if download_method == "html":
+            file_extension = "html"
+            write_mode = "w"
+            encoding = "utf-8"
             page: Page = await page_pool.get()
             try:
                 for attempt in range(max_retries):
@@ -226,13 +228,15 @@ async def downloader(
             else:
                 file_extension = get_extension_from_header(response_obj.headers.get("content-type", ""))
 
-            text_extensions = {"js", "css", "json", "txt"}
+            text_extensions = {"js", "css", "json", "html", "htm", "txt"}
             if file_extension in text_extensions:
                 try:
                     content = await response_obj.text()
                 except Exception as e:
                     logging.error(f"Error reading text content from {url}: {e}")
                     return
+                if file_extension == "js":
+                    content = beautify(content)
                 write_mode = "w"
                 encoding = "utf-8"
             else:
@@ -244,35 +248,16 @@ async def downloader(
                 write_mode = "wb"
                 encoding = None
 
-        # Determine content to save and calculate hash
-        if download_method == "html":
-            if args.markdown:
-                h = html2text.HTML2Text()
-                h.ignore_links = False  # Keep links in Markdown; set to True to ignore them
-                content_to_save = h.handle(content)
-                file_extension = "md"
-            else:
-                content_to_save = normalize_html(content)
-                file_extension = "html"
-            write_mode = "w"
-            encoding = "utf-8"
-            content_bytes = content_to_save.encode('utf-8')
+        # For HTML files, normalize the content before hashing to ignore dynamic differences.
+        if file_extension == "html":
+            normalized_content = normalize_html(content)
+            content_bytes = normalized_content.encode('utf-8')
         else:
-            content_to_save = content
-            if file_extension in {"js", "css", "json", "txt"}:
-                if file_extension == "js":
-                    content_to_save = beautify(content)
-                write_mode = "w"
-                encoding = "utf-8"
-                content_bytes = content_to_save.encode('utf-8')
-            else:
-                write_mode = "wb"
-                encoding = None
-                content_bytes = content_to_save
+            content_bytes = content.encode('utf-8') if write_mode == "w" else content
 
         content_hash = hashlib.md5(content_bytes).hexdigest()
 
-        # Check if duplicate content exists regardless of URL
+        # Check if duplicate content exists regardless of URL.
         if content_hash in downloaded_hashes:
             filename = downloaded_hashes[content_hash]
             logging.info(f"Duplicate content detected for {url}. Already downloaded as {filename}.")
@@ -280,7 +265,7 @@ async def downloader(
             await append_downloaded_url(url)
             return
 
-        # New filename: include sanitized path and 8 characters of content hash
+        # New filename: include sanitized path and 8 characters of content hash.
         filename = f"{sanitized_path}_{content_hash[:8]}.{file_extension}"
         subfolder = os.path.join(output_folder, file_extension)
         if not await asyncio.to_thread(os.path.exists, subfolder):
@@ -294,10 +279,10 @@ async def downloader(
                 temp_file_path = file_path + ".tmp"
                 if write_mode == "w":
                     async with aiofiles.open(temp_file_path, write_mode, encoding=encoding) as f:
-                        await f.write(content_to_save)
+                        await f.write(content)
                 else:
                     async with aiofiles.open(temp_file_path, write_mode) as f:
-                        await f.write(content_to_save)
+                        await f.write(content)
                 await asyncio.to_thread(os.replace, temp_file_path, file_path)
                 logging.info(f"Downloaded: {filename}")
 
@@ -314,13 +299,12 @@ async def downloader(
             return
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Combined Downloader with enhanced URL handling and optional HTML to Markdown conversion.")
+    parser = argparse.ArgumentParser(description="Combined Downloader with enhanced URL handling and duplicate detection using normalized HTML.")
     parser.add_argument("input_file", help="File containing list of URLs (one per line)")
     parser.add_argument("output_folder", help="Output folder for downloaded files")
     parser.add_argument("--concurrency", type=int, default=5, help="Maximum concurrent downloads (default: 5)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
     parser.add_argument("--logfile", help="Optional log file to write output to")
-    parser.add_argument("--markdown", action="store_true", help="Convert HTML files to Markdown (.md) instead of saving as HTML")
     args = parser.parse_args()
 
     logger = logging.getLogger()
